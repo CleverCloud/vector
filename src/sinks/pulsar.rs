@@ -7,12 +7,13 @@ use crate::{
 use futures01::{
     future, stream::FuturesUnordered, Async, AsyncSink, Future, Poll, Sink, StartSend, Stream,
 };
+use futures::compat::Compat;
 use pulsar::{
-    proto::CommandSendReceipt, Authentication, Producer, ProducerOptions, Pulsar, SubType,
+    proto::CommandSendReceipt, Authentication, Producer, ProducerOptions, Pulsar, SubType, TokioExecutor,
 };
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::mpsc::channel};
 
 type MetadataFuture<F, M> = future::Join<F, future::FutureResult<M, <F as Future>::Error>>;
 
@@ -47,7 +48,7 @@ struct PulsarSink {
     topic: String,
     encoding: Encoding,
     producer: Producer,
-    pulsar: Pulsar,
+    pulsar: Pulsar<TokioExecutor>,
     in_flight: FuturesUnordered<MetadataFuture<SendFuture, usize>>,
     // ack
     seq_head: usize,
@@ -90,9 +91,13 @@ impl PulsarSink {
             name: auth.name,
             data: auth.token.as_bytes().to_vec(),
         });
-        let pulsar = Pulsar::new(config.address.parse()?, auth, exec)
-            .wait()
-            .context(CreatePulsarSink)?;
+        let address = config.address.clone();
+        let (sender, receiver) = channel();
+        exec.spawn_std(async move {
+            let pulsar = Pulsar::new(&address, auth).await;
+            sender.send(pulsar).unwrap();
+        });
+        let pulsar = receiver.recv().unwrap().context(CreatePulsarSink)?;
         let producer = pulsar.producer(Some(ProducerOptions::default()));
 
         Ok(Self {
@@ -109,7 +114,7 @@ impl PulsarSink {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn pulsar(&self) -> &'_ Pulsar {
+    pub(crate) fn pulsar(&self) -> &'_ Pulsar<TokioExecutor> {
         &self.pulsar
     }
 }
@@ -120,12 +125,16 @@ impl Sink for PulsarSink {
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
         let message = encode_event(item, self.encoding).map_err(|_| ())?;
-        let fut = self.producer.send(self.topic.clone(), &message[..]);
+        let topic = self.topic.clone();
+        let producer = self.producer.clone();
+        let fut = async move {
+            producer.send(topic, message).await
+        };
 
         let seqno = self.seq_head;
         self.seq_head += 1;
         self.in_flight
-            .push((Box::new(fut) as SendFuture).join(future::ok(seqno)));
+            .push((Box::new(Compat::new(Box::pin(fut))) as SendFuture).join(future::ok(seqno)));
         Ok(AsyncSink::Ready)
     }
 
@@ -167,8 +176,8 @@ fn encode_event(item: Event, enc: Encoding) -> crate::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn healthcheck(config: PulsarSinkConfig, pulsar: Pulsar) -> super::Healthcheck {
-    Box::new(future::lazy(move || {
+fn healthcheck(config: PulsarSinkConfig, pulsar: Pulsar<TokioExecutor>) -> super::Healthcheck {
+    Box::new(Compat::new(Box::pin(async move {
         pulsar
             .consumer()
             .with_topic(&config.topic)
@@ -176,10 +185,11 @@ fn healthcheck(config: PulsarSinkConfig, pulsar: Pulsar) -> super::Healthcheck {
             .with_subscription_type(SubType::Shared)
             .with_subscription("HealthSubscription")
             .build::<String>()
-            .and_then(|consumer| consumer.take(1).collect())
-            .map(|_| ())
-            .map_err(|err| err.into())
-    }))
+            .await?
+            .check_connection()
+            .await?;
+        Ok(())
+    })))
 }
 
 #[cfg(test)]
@@ -213,7 +223,7 @@ mod tests {
 mod integration_tests {
     use super::*;
     use crate::test_util::{block_on, random_lines_with_stream, random_string};
-    use pulsar::Message;
+    use futures::{compat::Compat, stream::StreamExt};
     use std::{
         sync::atomic::AtomicUsize,
         sync::{Arc, Mutex},
@@ -235,16 +245,17 @@ mod integration_tests {
 
         let num_events = 1_000;
         let (_input, events) = random_lines_with_stream(100, num_events);
-        let consumer = sink
-            .pulsar()
-            .consumer()
-            .with_topic(&topic)
-            .with_consumer_name("VectorTestConsumer")
-            .with_subscription_type(SubType::Shared)
-            .with_subscription("VectorTestSub")
-            .build::<String>()
-            .wait()
-            .unwrap();
+        let pulsar = sink.pulsar().clone();
+        let mut consumer = block_on(Compat::new(Box::pin(async move {
+            pulsar
+                .consumer()
+                .with_topic(&topic)
+                .with_consumer_name("VectorTestConsumer")
+                .with_subscription_type(SubType::Shared)
+                .with_subscription("VectorTestSub")
+                .build::<String>()
+                .await
+        }))).unwrap();
 
         let pump = sink.send_all(events);
         let _ = block_on(pump).unwrap();
@@ -259,22 +270,20 @@ mod integration_tests {
 
         {
             let successes = successes.clone();
-            consumer
-                .take(1000)
-                .for_each(move |Message { payload, ack, .. }| {
-                    ack.ack();
-                    let _msg = payload.unwrap();
+            block_on(Compat::new(Box::pin(async move {
+                for _ in 0..1000u16 {
+                    let msg = match consumer.next().await.unwrap() {
+                        Ok(msg) => msg,
+                        Err(err) => {
+                            *error.lock().unwrap() = Some(err);
+                            break;
+                        }
+                    };
+                    consumer.ack(&msg).unwrap();
                     successes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Ok(())
-                })
-                .map_err({
-                    move |e| {
-                        let mut error = error.lock().unwrap();
-                        *error = Some(e);
-                    }
-                })
-                .wait()
-                .unwrap();
+                }
+                crate::Result::Ok(())
+            }))).unwrap();
         }
         assert_eq!(successes.load(std::sync::atomic::Ordering::Relaxed), 1000);
     }
