@@ -9,11 +9,11 @@ use futures01::{
 };
 use futures::compat::Compat;
 use pulsar::{
-    proto::CommandSendReceipt, Authentication, Producer, ProducerOptions, Pulsar, SubType, TokioExecutor,
+    Error as PulsarError, proto::CommandSendReceipt, Authentication, ProducerOptions, Pulsar, TopicProducer, TokioExecutor,
 };
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
-use std::{collections::HashSet, sync::mpsc::channel};
+use std::{collections::HashSet, sync::{Arc, mpsc::channel}};
 
 type MetadataFuture<F, M> = future::Join<F, future::FutureResult<M, <F as Future>::Error>>;
 
@@ -45,9 +45,8 @@ pub enum Encoding {
 }
 
 struct PulsarSink {
-    topic: String,
     encoding: Encoding,
-    producer: Producer,
+    producer: Arc<TopicProducer>,
     pulsar: Pulsar<TokioExecutor>,
     in_flight: FuturesUnordered<MetadataFuture<SendFuture, usize>>,
     // ack
@@ -68,7 +67,7 @@ inventory::submit! {
 impl SinkConfig for PulsarSinkConfig {
     fn build(&self, cx: SinkContext) -> crate::Result<(super::RouterSink, super::Healthcheck)> {
         let sink = PulsarSink::new(self.clone(), cx.acker(), cx.exec())?;
-        let hc = healthcheck(self.clone(), sink.pulsar.clone());
+        let hc = healthcheck(sink.producer.clone());
         Ok((Box::new(sink), hc))
     }
 
@@ -79,6 +78,12 @@ impl SinkConfig for PulsarSinkConfig {
     fn sink_type(&self) -> &'static str {
         "pulsar"
     }
+}
+
+async fn create_producer(address: String, auth: Option<Authentication>, topic: String) -> Result<(Pulsar<TokioExecutor>, TopicProducer), PulsarError> {
+    let pulsar = Pulsar::new(&address, auth).await?;
+    let producer = pulsar.create_producer(topic, None, ProducerOptions::default()).await?;
+    Ok((pulsar, producer))
 }
 
 impl PulsarSink {
@@ -92,19 +97,18 @@ impl PulsarSink {
             data: auth.token.as_bytes().to_vec(),
         });
         let address = config.address.clone();
+        let topic = config.topic.clone();
         let (sender, receiver) = channel();
         exec.spawn_std(async move {
-            let pulsar = Pulsar::new(&address, auth).await;
-            sender.send(pulsar).unwrap();
+            let res = create_producer(address, auth, topic).await;
+            sender.send(res).unwrap();
         });
-        let pulsar = receiver.recv().unwrap().context(CreatePulsarSink)?;
-        let producer = pulsar.producer(Some(ProducerOptions::default()));
+        let (pulsar, producer) = receiver.recv().unwrap().context(CreatePulsarSink)?;
 
         Ok(Self {
-            topic: config.topic,
             encoding: config.encoding,
             pulsar,
-            producer,
+            producer: Arc::new(producer),
             in_flight: FuturesUnordered::new(),
             seq_head: 0,
             seq_tail: 0,
@@ -125,10 +129,9 @@ impl Sink for PulsarSink {
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
         let message = encode_event(item, self.encoding).map_err(|_| ())?;
-        let topic = self.topic.clone();
         let producer = self.producer.clone();
         let fut = async move {
-            producer.send(topic, message).await
+            producer.send(message).await
         };
 
         let seqno = self.seq_head;
@@ -176,16 +179,9 @@ fn encode_event(item: Event, enc: Encoding) -> crate::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn healthcheck(config: PulsarSinkConfig, pulsar: Pulsar<TokioExecutor>) -> super::Healthcheck {
+fn healthcheck(producer: Arc<TopicProducer>) -> super::Healthcheck {
     Box::new(Compat::new(Box::pin(async move {
-        pulsar
-            .consumer()
-            .with_topic(&config.topic)
-            .with_consumer_name("Healthcheck")
-            .with_subscription_type(SubType::Shared)
-            .with_subscription("HealthSubscription")
-            .build::<String>()
-            .await?
+        producer
             .check_connection()
             .await?;
         Ok(())
@@ -223,6 +219,7 @@ mod tests {
 mod integration_tests {
     use super::*;
     use crate::test_util::{block_on, random_lines_with_stream, random_string};
+    use pulsar::SubType;
     use futures::{compat::Compat, stream::StreamExt};
     use std::{
         sync::atomic::AtomicUsize,
