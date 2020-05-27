@@ -9,7 +9,7 @@ use futures01::{
 };
 use futures::compat::Compat;
 use pulsar::{
-    proto::CommandSendReceipt, Authentication, Producer, ProducerOptions, Pulsar, SubType, TokioExecutor,
+    proto::CommandSendReceipt, Authentication, TopicProducer, Producer, ProducerOptions, Pulsar, SubType, TokioExecutor,
 };
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
@@ -45,9 +45,9 @@ pub enum Encoding {
 }
 
 struct PulsarSink {
-    topic: String,
+    //topic: String,
     encoding: Encoding,
-    producer: Producer,
+    producer: TopicProducer,
     pulsar: Pulsar<TokioExecutor>,
     in_flight: FuturesUnordered<MetadataFuture<SendFuture, usize>>,
     // ack
@@ -68,7 +68,7 @@ inventory::submit! {
 impl SinkConfig for PulsarSinkConfig {
     fn build(&self, cx: SinkContext) -> crate::Result<(super::RouterSink, super::Healthcheck)> {
         let sink = PulsarSink::new(self.clone(), cx.acker(), cx.exec())?;
-        let hc = healthcheck(self.clone(), sink.pulsar.clone());
+        let hc = healthcheck(self.clone(), sink.producer.clone());
         Ok((Box::new(sink), hc))
     }
 
@@ -98,10 +98,17 @@ impl PulsarSink {
             sender.send(pulsar).unwrap();
         });
         let pulsar = receiver.recv().unwrap().context(CreatePulsarSink)?;
-        let producer = pulsar.producer(Some(ProducerOptions::default()));
+
+        let (sender, receiver) = channel();
+        exec.spawn_std(async move {
+            let producer = pulsar.create_producer(config.topic.clone(), None, ProducerOptions::default()).await;
+            sender.send(producer).unwrap()
+        });
+
+        let producer = receiver.recv().unwrap().context(CreatePulsarSink)?;
 
         Ok(Self {
-            topic: config.topic,
+            //topic: config.topic,
             encoding: config.encoding,
             pulsar,
             producer,
@@ -125,10 +132,10 @@ impl Sink for PulsarSink {
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
         let message = encode_event(item, self.encoding).map_err(|_| ())?;
-        let topic = self.topic.clone();
+        //let topic = self.topic.clone();
         let producer = self.producer.clone();
         let fut = async move {
-            producer.send(topic, message).await
+            producer.send(message).await
         };
 
         let seqno = self.seq_head;
@@ -176,16 +183,9 @@ fn encode_event(item: Event, enc: Encoding) -> crate::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn healthcheck(config: PulsarSinkConfig, pulsar: Pulsar<TokioExecutor>) -> super::Healthcheck {
+fn healthcheck(config: PulsarSinkConfig, producer: TopicProducer) -> super::Healthcheck {
     Box::new(Compat::new(Box::pin(async move {
-        pulsar
-            .consumer()
-            .with_topic(&config.topic)
-            .with_consumer_name("Healthcheck")
-            .with_subscription_type(SubType::Shared)
-            .with_subscription("HealthSubscription")
-            .build::<String>()
-            .await?
+        producer
             .check_connection()
             .await?;
         Ok(())
