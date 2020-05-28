@@ -13,7 +13,7 @@ use pulsar::{
 };
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
-use std::{collections::HashSet, sync::{Arc, mpsc::channel}};
+use std::{collections::HashSet, sync::{Arc, Mutex, mpsc::channel}};
 
 type MetadataFuture<F, M> = future::Join<F, future::FutureResult<M, <F as Future>::Error>>;
 
@@ -46,7 +46,7 @@ pub enum Encoding {
 
 struct PulsarSink {
     encoding: Encoding,
-    producer: Arc<TopicProducer>,
+    producer: Arc<Mutex<TopicProducer<TokioExecutor>>>,
     pulsar: Pulsar<TokioExecutor>,
     in_flight: FuturesUnordered<MetadataFuture<SendFuture, usize>>,
     // ack
@@ -80,7 +80,7 @@ impl SinkConfig for PulsarSinkConfig {
     }
 }
 
-async fn create_producer(address: String, auth: Option<Authentication>, topic: String) -> Result<(Pulsar<TokioExecutor>, TopicProducer), PulsarError> {
+async fn create_producer(address: String, auth: Option<Authentication>, topic: String) -> Result<(Pulsar<TokioExecutor>, TopicProducer<TokioExecutor>), PulsarError> {
     let pulsar = Pulsar::new(&address, auth).await?;
     let producer = pulsar.create_producer(topic, None, ProducerOptions::default()).await?;
     Ok((pulsar, producer))
@@ -108,7 +108,7 @@ impl PulsarSink {
         Ok(Self {
             encoding: config.encoding,
             pulsar,
-            producer: Arc::new(producer),
+            producer: Arc::new(Mutex::new(producer)),
             in_flight: FuturesUnordered::new(),
             seq_head: 0,
             seq_tail: 0,
@@ -129,7 +129,7 @@ impl Sink for PulsarSink {
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
         let message = encode_event(item, self.encoding).map_err(|_| ())?;
-        let producer = self.producer.clone();
+        let producer = self.producer.lock().unwrap().clone();
         let fut = async move {
             producer.send(message).await
         };
@@ -179,7 +179,7 @@ fn encode_event(item: Event, enc: Encoding) -> crate::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn healthcheck(producer: Arc<TopicProducer>) -> super::Healthcheck {
+fn healthcheck(producer: Arc<TopicProducer<TokioExecutor>>) -> super::Healthcheck {
     Box::new(Compat::new(Box::pin(async move {
         producer
             .check_connection()
