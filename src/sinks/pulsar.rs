@@ -7,7 +7,7 @@ use crate::{
 use futures01::{
     future, stream::FuturesUnordered, Async, AsyncSink, Future, Poll, Sink, StartSend, Stream,
 };
-use futures::compat::Compat;
+use futures::{compat::Compat, lock::Mutex};
 use pulsar::{
     Error as PulsarError, proto::CommandSendReceipt, Authentication, ProducerOptions, Pulsar, TopicProducer, TokioExecutor,
 };
@@ -46,7 +46,7 @@ pub enum Encoding {
 
 struct PulsarSink {
     encoding: Encoding,
-    producer: Arc<TopicProducer>,
+    producer: Arc<Mutex<TopicProducer<TokioExecutor>>>,
     pulsar: Pulsar<TokioExecutor>,
     in_flight: FuturesUnordered<MetadataFuture<SendFuture, usize>>,
     // ack
@@ -80,7 +80,7 @@ impl SinkConfig for PulsarSinkConfig {
     }
 }
 
-async fn create_producer(address: String, auth: Option<Authentication>, topic: String) -> Result<(Pulsar<TokioExecutor>, TopicProducer), PulsarError> {
+async fn create_producer(address: String, auth: Option<Authentication>, topic: String) -> Result<(Pulsar<TokioExecutor>, TopicProducer<TokioExecutor>), PulsarError> {
     let pulsar = Pulsar::new(&address, auth).await?;
     let producer = pulsar.create_producer(topic, None, ProducerOptions::default()).await?;
     Ok((pulsar, producer))
@@ -108,7 +108,7 @@ impl PulsarSink {
         Ok(Self {
             encoding: config.encoding,
             pulsar,
-            producer: Arc::new(producer),
+            producer: Arc::new(Mutex::new(producer)),
             in_flight: FuturesUnordered::new(),
             seq_head: 0,
             seq_tail: 0,
@@ -131,7 +131,7 @@ impl Sink for PulsarSink {
         let message = encode_event(item, self.encoding).map_err(|_| ())?;
         let producer = self.producer.clone();
         let fut = async move {
-            producer.send(message).await
+            producer.lock().await.send(message).await
         };
 
         let seqno = self.seq_head;
@@ -179,9 +179,11 @@ fn encode_event(item: Event, enc: Encoding) -> crate::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn healthcheck(producer: Arc<TopicProducer>) -> super::Healthcheck {
+fn healthcheck(producer: Arc<Mutex<TopicProducer<TokioExecutor>>>) -> super::Healthcheck {
     Box::new(Compat::new(Box::pin(async move {
         producer
+            .lock()
+            .await
             .check_connection()
             .await?;
         Ok(())
