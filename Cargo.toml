@@ -172,7 +172,7 @@ heim = { version = "0.1.0-rc.1", features = ["full"], optional = true }
 hostname = "0.3.1"
 http = "0.2"
 hyper = "0.13"
-hyper-openssl = "0.8"
+hyper-openssl = "0.9"
 indexmap = {version = "1.6.2", features = ["serde"]}
 indoc = "1.0.3"
 inventory = "0.1.10"
