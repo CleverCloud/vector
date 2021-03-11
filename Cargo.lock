@@ -7522,17 +7522,6 @@ dependencies = [
 
 [[package]]
 name = "tokio-test"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed0049c119b6d505c4447f5c64873636c7af6c75ab0d45fd9f618d82acb8016d"
-dependencies = [
- "bytes 0.5.6",
- "futures-core",
- "tokio 0.2.25",
-]
-
-[[package]]
-name = "tokio-test"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c7d205f6f59b03f9e824ac86eaba635a98395f287756ecc8a06464779c399bf"
@@ -7666,14 +7655,14 @@ checksum = "360dfd1d6d30e05fda32ace2c8c70e9c0a9da713275777f5a4dbb8a1893930c6"
 
 [[package]]
 name = "tower-test"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ba4bbc2c1e4a8543c30d4c13a4c8314ed72d6e07581910f665aa13fde0153c8"
+checksum = "a4546773ffeab9e4ea02b8872faa49bb616a80a7da66afc2f32688943f97efa7"
 dependencies = [
  "futures-util",
- "pin-project 0.4.27",
- "tokio 0.2.25",
- "tokio-test 0.2.1",
+ "pin-project 1.0.5",
+ "tokio 1.2.0",
+ "tokio-test",
  "tower-layer",
  "tower-service",
 ]
@@ -8316,7 +8305,7 @@ dependencies = [
  "tokio 0.2.25",
  "tokio-openssl",
  "tokio-postgres",
- "tokio-test 0.4.0",
+ "tokio-test",
  "tokio-util 0.3.1",
  "tokio01-test",
  "toml",
